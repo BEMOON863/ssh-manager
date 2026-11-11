@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod model;
+pub mod probe;
 pub mod ssh;
 pub mod store;
 pub mod theme;

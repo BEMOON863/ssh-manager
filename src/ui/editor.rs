@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::model::{self, Server};
+use crate::model::{self, Server, Tunnel};
 use crate::theme;
 
 /// Состояние формы сервера.
@@ -50,7 +50,7 @@ pub fn show(ctx: &egui::Context, editor: &mut ServerEditor) -> Option<EditorActi
     };
 
     let modal = egui::Modal::new(egui::Id::unique("server-editor")).show(ctx, |ui| {
-        ui.set_width(580.0);
+        ui.set_width(600.0);
         ui.heading(title);
         ui.add_space(8.0);
 
@@ -91,6 +91,41 @@ pub fn show(ctx: &egui::Context, editor: &mut ServerEditor) -> Option<EditorActi
 
                 ui.label("Jump-хост (-J)");
                 ui.text_edit_singleline(&mut editor.draft.jump);
+                ui.end_row();
+
+                ui.label("Пробросы (-L)");
+                ui.vertical(|ui| {
+                    let mut remove_index: Option<usize> = None;
+                    for (index, tunnel) in editor.draft.tunnels.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("#{}", index + 1));
+                            ui.add(
+                                egui::DragValue::new(&mut tunnel.local_port)
+                                    .range(0..=65535)
+                                    .prefix("L:"),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut tunnel.remote_host)
+                                    .hint_text("удалённый хост")
+                                    .desired_width(170.0),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut tunnel.remote_port)
+                                    .range(0..=65535)
+                                    .prefix(":"),
+                            );
+                            if ui.small_button("Удалить").clicked() {
+                                remove_index = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove_index {
+                        editor.draft.tunnels.remove(index);
+                    }
+                    if ui.button("+ Проброс").clicked() {
+                        editor.draft.tunnels.push(Tunnel::new());
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Заметки");

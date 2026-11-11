@@ -1,16 +1,20 @@
 //! Состояние приложения и обработка действий пользователя.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
 
-use crate::model::{self, AppConfig, GroupFilter, Server};
-use crate::ssh::{command, config_import, launch};
+use crate::model::{self, AppConfig, GroupFilter, Server, Snippet};
+use crate::probe::{self, ProbeMessage, ProbeStatus};
+use crate::ssh::{command, config_import, keygen, launch};
 use crate::store;
 use crate::ui::editor::{EditorAction, ServerEditor};
 use crate::ui::import::{ImportAction, ImportDialog};
+use crate::ui::keygen::{KeygenAction, KeygenDialog};
+use crate::ui::snippets::{SnippetEditor, SnippetEditorAction};
 
 /// Вкладки приложения.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -18,6 +22,19 @@ pub enum Tab {
     /// Список серверов.
     #[default]
     Servers,
+    /// Сниппеты команд.
+    Snippets,
+    /// Обзор локальных туннелей.
+    Tunnels,
+}
+
+/// Что именно удаляем после подтверждения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteTarget {
+    /// Сервер с указанным id.
+    Server(u64),
+    /// Сниппет с указанным id.
+    Snippet(u64),
 }
 
 /// Главное состояние GUI.
@@ -30,8 +47,15 @@ pub struct ManagerApp {
     pub(crate) search: String,
     pub(crate) group_filter: GroupFilter,
     pub(crate) editor: Option<ServerEditor>,
-    pub(crate) delete_confirm: Option<u64>,
+    pub(crate) delete_confirm: Option<DeleteTarget>,
     pub(crate) import: Option<ImportDialog>,
+    pub(crate) probes: HashMap<u64, ProbeStatus>,
+    probe_sender: Sender<ProbeMessage>,
+    probe_receiver: Receiver<ProbeMessage>,
+    pub(crate) pending_connect: Option<u64>,
+    pub(crate) snippet_search: String,
+    pub(crate) snippet_editor: Option<SnippetEditor>,
+    pub(crate) keygen: Option<KeygenDialog>,
 }
 
 impl ManagerApp {
@@ -40,6 +64,7 @@ impl ManagerApp {
         crate::theme::setup(&cc.egui_ctx);
 
         let loaded = store::load();
+        let (probe_sender, probe_receiver) = mpsc::channel();
         let mut app = Self {
             config: loaded.config,
             data_path: store::data_path(),
@@ -51,6 +76,13 @@ impl ManagerApp {
             editor: None,
             delete_confirm: None,
             import: None,
+            probes: HashMap::new(),
+            probe_sender,
+            probe_receiver,
+            pending_connect: None,
+            snippet_search: String::new(),
+            snippet_editor: None,
+            keygen: None,
         };
 
         if loaded.first_run {
@@ -133,13 +165,14 @@ impl ManagerApp {
     fn delete_server(&mut self, id: u64) {
         let before = self.config.servers.len();
         self.config.servers.retain(|server| server.id != id);
+        self.probes.remove(&id);
         if self.config.servers.len() != before {
             self.status = "Сервер удалён.".to_string();
         }
         self.persist();
     }
 
-    /// Запускает SSH-сессию в терминале.
+    /// Запускает SSH-сессию (с подтверждением для Prod-серверов).
     pub(crate) fn connect(&mut self, id: u64) {
         let Some(server) = self
             .config
@@ -151,7 +184,16 @@ impl ManagerApp {
             return;
         };
 
-        match launch::launch(&server) {
+        if model::requires_prod_guard(&server) {
+            self.pending_connect = Some(id);
+            return;
+        }
+
+        self.launch_session(&server);
+    }
+
+    fn launch_session(&mut self, server: &Server) {
+        match launch::launch(server) {
             Ok(launcher) => {
                 self.status = format!("Сессия к {} запущена в {}.", server.name, launcher.label());
             }
@@ -219,6 +261,118 @@ impl ManagerApp {
         self.persist();
     }
 
+    /// Запускает TCP-проверку одного сервера.
+    pub(crate) fn probe_one(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.spawn_probe(ctx, &server);
+    }
+
+    /// Запускает TCP-проверку всех серверов.
+    pub(crate) fn probe_all(&mut self, ctx: &egui::Context) {
+        let servers = self.config.servers.clone();
+        if servers.is_empty() {
+            self.status = "Нет серверов для проверки.".to_string();
+            return;
+        }
+        for server in &servers {
+            self.spawn_probe(ctx, server);
+        }
+        self.status = format!("Проверяю {} серверов…", servers.len());
+    }
+
+    fn spawn_probe(&mut self, ctx: &egui::Context, server: &Server) {
+        if matches!(self.probes.get(&server.id), Some(ProbeStatus::Checking)) {
+            return;
+        }
+        self.probes.insert(server.id, ProbeStatus::Checking);
+
+        let sender = self.probe_sender.clone();
+        let ctx = ctx.clone();
+        let server = server.clone();
+        std::thread::spawn(move || {
+            let result = probe::probe_host(&server.host, server.port, probe::PROBE_TIMEOUT);
+            let _ = sender.send(ProbeMessage {
+                server_id: server.id,
+                result,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn apply_probe(&mut self, message: ProbeMessage) {
+        let status = match message.result {
+            Ok(rtt_ms) => ProbeStatus::Online { rtt_ms },
+            Err(reason) => ProbeStatus::Offline { reason },
+        };
+        self.probes.insert(message.server_id, status);
+    }
+
+    /// Открывает форму нового сниппета.
+    pub(crate) fn open_new_snippet(&mut self) {
+        self.snippet_editor = Some(SnippetEditor::new(self.config.next_snippet_id()));
+    }
+
+    /// Открывает форму редактирования сниппета.
+    pub(crate) fn open_snippet_editor(&mut self, id: u64) {
+        if let Some(snippet) = self.config.snippets.iter().find(|snippet| snippet.id == id) {
+            self.snippet_editor = Some(SnippetEditor::edit(snippet));
+        }
+    }
+
+    fn save_snippet(&mut self, snippet: Snippet) {
+        let is_new = !self
+            .config
+            .snippets
+            .iter()
+            .any(|existing| existing.id == snippet.id);
+
+        if is_new {
+            self.config.snippets.push(snippet);
+            self.status = "Сниппет добавлен.".to_string();
+        } else if let Some(existing) = self
+            .config
+            .snippets
+            .iter_mut()
+            .find(|existing| existing.id == snippet.id)
+        {
+            *existing = snippet;
+            self.status = "Сниппет обновлён.".to_string();
+        }
+
+        self.persist();
+    }
+
+    fn delete_snippet(&mut self, id: u64) {
+        let before = self.config.snippets.len();
+        self.config.snippets.retain(|snippet| snippet.id != id);
+        if self.config.snippets.len() != before {
+            self.status = "Сниппет удалён.".to_string();
+        }
+        self.persist();
+    }
+
+    /// Копирует команду сниппета в буфер обмена.
+    pub(crate) fn copy_snippet(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(snippet) = self.config.snippets.iter().find(|snippet| snippet.id == id) else {
+            return;
+        };
+        ctx.copy_text(snippet.command.clone());
+        self.status = format!("Команда скопирована: {}", snippet.command);
+    }
+
+    /// Открывает окно генератора ключей.
+    pub(crate) fn open_keygen(&mut self) {
+        self.keygen = Some(KeygenDialog::new());
+    }
+
     /// Пишет `servers.json`; ошибки показывает в баннере.
     fn persist(&mut self) {
         if let Err(error) = store::save_to(&self.data_path, &self.config) {
@@ -247,44 +401,144 @@ impl ManagerApp {
             }
         }
 
-        if let Some(id) = self.delete_confirm {
-            let name = self
-                .config
-                .servers
-                .iter()
-                .find(|server| server.id == id)
-                .map(|server| server.name.clone())
-                .unwrap_or_default();
-            let mut decision: Option<bool> = None;
+        if let Some(mut editor) = self.snippet_editor.take() {
+            match crate::ui::snippets::show_editor(ctx, &mut editor) {
+                Some(SnippetEditorAction::Save(snippet)) => self.save_snippet(snippet),
+                Some(SnippetEditorAction::Cancel) => {}
+                None => self.snippet_editor = Some(editor),
+            }
+        }
 
-            let modal =
-                egui::Modal::new(egui::Id::unique("delete-server-confirm")).show(ctx, |ui| {
-                    ui.set_width(380.0);
-                    ui.heading("Удалить сервер?");
-                    ui.label(format!("Сервер «{name}» будет удалён из списка."));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(egui::Button::new("Удалить").fill(crate::theme::DANGER))
-                            .clicked()
-                        {
-                            decision = Some(true);
+        if let Some(mut dialog) = self.keygen.take() {
+            match crate::ui::keygen::show(ctx, &mut dialog) {
+                Some(KeygenAction::Generate) => {
+                    match keygen::generate(&dialog.path, &dialog.comment) {
+                        Ok(generated) => {
+                            self.status =
+                                format!("Ключ создан: {}", generated.private_path.display());
+                            dialog.result = Some(generated);
+                            dialog.error = None;
                         }
-                        if ui.button("Отмена").clicked() {
-                            decision = Some(false);
-                        }
-                    });
+                        Err(error) => dialog.error = Some(error),
+                    }
+                    self.keygen = Some(dialog);
+                }
+                Some(KeygenAction::Cancel) => {}
+                None => self.keygen = Some(dialog),
+            }
+        }
+
+        if let Some(target) = self.delete_confirm {
+            let (title, description) = match target {
+                DeleteTarget::Server(id) => {
+                    let name = self
+                        .config
+                        .servers
+                        .iter()
+                        .find(|server| server.id == id)
+                        .map(|server| server.name.clone())
+                        .unwrap_or_default();
+                    (
+                        "Удалить сервер?",
+                        format!("Сервер «{name}» будет удалён из списка."),
+                    )
+                }
+                DeleteTarget::Snippet(id) => {
+                    let name = self
+                        .config
+                        .snippets
+                        .iter()
+                        .find(|snippet| snippet.id == id)
+                        .map(|snippet| snippet.name.clone())
+                        .unwrap_or_default();
+                    (
+                        "Удалить сниппет?",
+                        format!("Сниппет «{name}» будет удалён."),
+                    )
+                }
+            };
+
+            let mut decision: Option<bool> = None;
+            let modal = egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.heading(title);
+                ui.label(description);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Удалить").fill(crate::theme::DANGER))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Отмена").clicked() {
+                        decision = Some(false);
+                    }
                 });
+            });
 
             if decision.is_none() && modal.should_close() {
                 decision = Some(false);
             }
             match decision {
                 Some(true) => {
-                    self.delete_server(id);
+                    match target {
+                        DeleteTarget::Server(id) => self.delete_server(id),
+                        DeleteTarget::Snippet(id) => self.delete_snippet(id),
+                    }
                     self.delete_confirm = None;
                 }
                 Some(false) => self.delete_confirm = None,
+                None => {}
+            }
+        }
+
+        if let Some(id) = self.pending_connect {
+            let Some(server) = self
+                .config
+                .servers
+                .iter()
+                .find(|server| server.id == id)
+                .cloned()
+            else {
+                self.pending_connect = None;
+                return;
+            };
+
+            let mut decision: Option<bool> = None;
+            let modal = egui::Modal::new(egui::Id::unique("prod-guard")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.heading(egui::RichText::new("Prod Guard").color(crate::theme::DANGER));
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Вы подключаетесь к Production-серверу «{}» ({}).",
+                    server.name,
+                    crate::ui::format_target(&server)
+                ));
+                ui.label("Продолжить?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Продолжить").fill(crate::theme::DANGER))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Отмена").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+            if decision.is_none() && modal.should_close() {
+                decision = Some(false);
+            }
+            match decision {
+                Some(true) => {
+                    self.pending_connect = None;
+                    self.launch_session(&server);
+                }
+                Some(false) => self.pending_connect = None,
                 None => {}
             }
         }
@@ -292,6 +546,17 @@ impl ManagerApp {
 }
 
 impl eframe::App for ManagerApp {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut updates = 0usize;
+        while let Ok(message) = self.probe_receiver.try_recv() {
+            self.apply_probe(message);
+            updates += 1;
+        }
+        if updates > 0 {
+            self.status = format!("Обновлены результаты проверки: {updates}.");
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
@@ -301,7 +566,11 @@ impl eframe::App for ManagerApp {
             .resizable(true)
             .default_size(220.0)
             .show(ui, |ui| self.groups_ui(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.servers_ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Servers => self.servers_ui(ui),
+            Tab::Snippets => self.snippets_ui(ui),
+            Tab::Tunnels => self.tunnels_ui(ui),
+        });
 
         self.modals(&ctx);
     }
@@ -310,6 +579,7 @@ impl eframe::App for ManagerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::ProbeStatus;
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -332,6 +602,7 @@ mod tests {
         }
 
         fn app(&self, servers: Vec<Server>) -> ManagerApp {
+            let (probe_sender, probe_receiver) = mpsc::channel();
             ManagerApp {
                 config: AppConfig {
                     servers,
@@ -346,6 +617,13 @@ mod tests {
                 editor: None,
                 delete_confirm: None,
                 import: None,
+                probes: HashMap::new(),
+                probe_sender,
+                probe_receiver,
+                pending_connect: None,
+                snippet_search: String::new(),
+                snippet_editor: None,
+                keygen: None,
             }
         }
     }
@@ -458,5 +736,57 @@ mod tests {
                 .iter()
                 .any(|server| server.name == "fresh")
         );
+    }
+
+    #[test]
+    fn prod_connect_requires_confirmation() {
+        let data = TempData::new();
+        let mut app = data.app(vec![server(1, "prod-web", "10.0.0.1", "Prod")]);
+
+        app.connect(1);
+        assert_eq!(app.pending_connect, Some(1));
+    }
+
+    #[test]
+    fn probe_results_update_status_map() {
+        let data = TempData::new();
+        let mut app = data.app(vec![server(1, "web", "10.0.0.1", "")]);
+
+        app.apply_probe(ProbeMessage {
+            server_id: 1,
+            result: Ok(17),
+        });
+        assert_eq!(
+            app.probes.get(&1),
+            Some(&ProbeStatus::Online { rtt_ms: 17 })
+        );
+
+        app.apply_probe(ProbeMessage {
+            server_id: 1,
+            result: Err("нет маршрута".to_string()),
+        });
+        assert!(matches!(
+            app.probes.get(&1),
+            Some(ProbeStatus::Offline { .. })
+        ));
+    }
+
+    #[test]
+    fn snippets_are_saved_and_deleted() {
+        let data = TempData::new();
+        let mut app = data.app(Vec::new());
+
+        app.save_snippet(Snippet {
+            id: 1,
+            name: "Логи".to_string(),
+            command: "tail -f /var/log/syslog".to_string(),
+        });
+
+        let loaded = store::load_from(&app.data_path);
+        assert_eq!(loaded.config.snippets.len(), 1);
+        assert_eq!(loaded.config.snippets[0].command, "tail -f /var/log/syslog");
+
+        app.delete_snippet(1);
+        assert!(store::load_from(&app.data_path).config.snippets.is_empty());
     }
 }

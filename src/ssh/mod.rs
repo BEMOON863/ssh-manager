@@ -2,4 +2,5 @@
 
 pub mod command;
 pub mod config_import;
+pub mod keygen;
 pub mod launch;
