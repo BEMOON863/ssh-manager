@@ -9,8 +9,21 @@
 
 ![Список серверов с результатами TCP-проверки](docs/screenshots/servers.png)
 
+## Скачать
+
+Готовые сборки — на странице **[Releases](https://github.com/BEMOON863/ssh-manager/releases/latest)**:
+
+| Файл | Что это |
+|---|---|
+| `Ssh-manager-Setup-0.1.0.exe` | Установщик: ставит приложение в `%LOCALAPPDATA%\Programs\Ssh-manager`, создаёт ярлык в меню «Пуск» и пункт удаления в «Программы и компоненты» |
+| `Ssh-manager-0.1.0-windows-x64.zip` | Портативная версия: распаковать в любую папку и запустить `Ssh-manager.exe`; `servers.json` создастся рядом |
+
+> Сборки не подписаны сертификатом, поэтому Windows SmartScreen может показать «Неизвестный издатель».
+> Нажмите «Подробнее» → «Выполнить всё равно». Скачивайте файлы только со страницы Releases этого репозитория.
+
 ## Содержание
 
+- [Скачать](#скачать)
 - [Возможности](#возможности)
 - [Требования](#требования)
 - [Установка и запуск](#установка-и-запуск)
@@ -326,6 +339,9 @@ cargo run
   `cargo check --all-targets` и `cargo clippy --all-targets -- -D warnings`
   и останавливается на первой ошибке.
 - Тесты используют каталог `target\test-data`; сеть и реальные SSH-серверы не нужны.
+- Сборка установщика: нужен Inno Setup 6+, затем
+  `ISCC.exe installer\setup.iss` (ожидает готовый `target\release\Ssh-manager.exe`);
+  результат появится в `target\release\dist\Ssh-manager-Setup-0.1.0.exe`.
 - Для сборки с OpenGL-бэкендом вместо wgpu: заменить в `Cargo.toml` зависимость
   `eframe = "0.37"` на `eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "system_fonts", "accesskit", "links"] }`.
 
