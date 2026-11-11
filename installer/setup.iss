@@ -1,4 +1,4 @@
-; Установщик Ssh-manager (Inno Setup 6).
+﻿; Установщик Ssh-manager (Inno Setup 6).
 ; Сборка: target\tools\InnoSetup6\app\ISCC.exe installer\setup.iss
 
 #define AppName "Ssh-manager"
