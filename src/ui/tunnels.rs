@@ -73,7 +73,7 @@ impl ManagerApp {
 
         if let Some(action) = action {
             match action {
-                TunnelRowAction::Connect(id) => self.connect(id),
+                TunnelRowAction::Connect(id) => self.open_terminal(ui.ctx(), id),
                 TunnelRowAction::Copy(id) => self.copy_command(ui.ctx(), id),
             }
         }

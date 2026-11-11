@@ -2,7 +2,7 @@
 ; Сборка: target\tools\InnoSetup6\app\ISCC.exe installer\setup.iss
 
 #define AppName "Ssh-manager"
-#define AppVersion "0.1.1"
+#define AppVersion "0.2.0"
 #define AppPublisher "BEMOON863"
 #define AppURL "https://github.com/BEMOON863/ssh-manager"
 #define AppExeName "Ssh-manager.exe"
@@ -16,7 +16,7 @@ AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
 AppSupportURL={#AppURL}
 AppUpdatesURL={#AppURL}/releases
-VersionInfoVersion=0.1.1.0
+VersionInfoVersion=0.2.0.0
 VersionInfoDescription=Ssh-manager {#AppVersion} installer
 SetupIconFile=..\assets\icon.ico
 DefaultDirName={localappdata}\Programs\Ssh-manager

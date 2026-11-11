@@ -9,12 +9,16 @@ use eframe::egui;
 
 use crate::model::{self, AppConfig, GroupFilter, Server, Snippet};
 use crate::probe::{self, ProbeMessage, ProbeStatus};
+use crate::remote_files::{self, FilesMessage, FilesRequest};
 use crate::ssh::{command, config_import, keygen, launch};
 use crate::store;
+use crate::terminal::{TerminalSession, TerminalSize};
 use crate::ui::editor::{EditorAction, ServerEditor};
+use crate::ui::files::FilesWindow;
 use crate::ui::import::{ImportAction, ImportDialog};
 use crate::ui::keygen::{KeygenAction, KeygenDialog};
 use crate::ui::snippets::{SnippetEditor, SnippetEditorAction};
+use crate::ui::terminal::TerminalWindow;
 
 /// Вкладки приложения.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,6 +41,17 @@ pub enum DeleteTarget {
     Snippet(u64),
 }
 
+/// Действие, которое нужно подтвердить для Prod-сервера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Внешний терминал (Windows Terminal / cmd.exe).
+    External(u64),
+    /// Встроенный терминал.
+    Terminal(u64),
+    /// Окно файлов на сервере.
+    Files(u64),
+}
+
 /// Главное состояние GUI.
 pub struct ManagerApp {
     pub(crate) config: AppConfig,
@@ -52,7 +67,13 @@ pub struct ManagerApp {
     pub(crate) probes: HashMap<u64, ProbeStatus>,
     probe_sender: Sender<ProbeMessage>,
     probe_receiver: Receiver<ProbeMessage>,
-    pub(crate) pending_connect: Option<u64>,
+    pub(crate) pending_action: Option<PendingAction>,
+    pub(crate) terminals: Vec<TerminalWindow>,
+    next_terminal_id: u64,
+    pub(crate) files_windows: Vec<FilesWindow>,
+    files_sender: Sender<FilesMessage>,
+    files_receiver: Receiver<FilesMessage>,
+    next_files_id: u64,
     pub(crate) snippet_search: String,
     pub(crate) snippet_editor: Option<SnippetEditor>,
     pub(crate) keygen: Option<KeygenDialog>,
@@ -65,6 +86,7 @@ impl ManagerApp {
 
         let loaded = store::load();
         let (probe_sender, probe_receiver) = mpsc::channel();
+        let (files_sender, files_receiver) = mpsc::channel();
         let mut app = Self {
             config: loaded.config,
             data_path: store::data_path(),
@@ -79,7 +101,13 @@ impl ManagerApp {
             probes: HashMap::new(),
             probe_sender,
             probe_receiver,
-            pending_connect: None,
+            pending_action: None,
+            terminals: Vec::new(),
+            next_terminal_id: 1,
+            files_windows: Vec::new(),
+            files_sender,
+            files_receiver,
+            next_files_id: 1,
             snippet_search: String::new(),
             snippet_editor: None,
             keygen: None,
@@ -166,14 +194,54 @@ impl ManagerApp {
         let before = self.config.servers.len();
         self.config.servers.retain(|server| server.id != id);
         self.probes.remove(&id);
+        self.terminals
+            .retain(|terminal| terminal.session.server_id != id);
+        self.files_windows.retain(|window| window.server_id != id);
         if self.config.servers.len() != before {
             self.status = "Сервер удалён.".to_string();
         }
         self.persist();
     }
 
-    /// Запускает SSH-сессию (с подтверждением для Prod-серверов).
-    pub(crate) fn connect(&mut self, id: u64) {
+    /// Запускает SSH-сессию во внешнем терминале (с подтверждением для Prod).
+    pub(crate) fn launch_external(&mut self, id: u64) {
+        if self.requires_prod_guard(id) {
+            self.pending_action = Some(PendingAction::External(id));
+            return;
+        }
+        self.launch_external_now(id);
+    }
+
+    /// Открывает встроенный терминал (с подтверждением для Prod).
+    pub(crate) fn open_terminal(&mut self, ctx: &egui::Context, id: u64) {
+        if self.requires_prod_guard(id) {
+            self.pending_action = Some(PendingAction::Terminal(id));
+            return;
+        }
+        self.open_terminal_now(ctx, id);
+    }
+
+    fn requires_prod_guard(&self, id: u64) -> bool {
+        self.config
+            .servers
+            .iter()
+            .any(|server| server.id == id && model::requires_prod_guard(server))
+    }
+
+    fn launch_external_now(&mut self, id: u64) {
+        let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.launch_session(&server);
+    }
+
+    fn open_terminal_now(&mut self, ctx: &egui::Context, id: u64) {
         let Some(server) = self
             .config
             .servers
@@ -184,12 +252,15 @@ impl ManagerApp {
             return;
         };
 
-        if model::requires_prod_guard(&server) {
-            self.pending_connect = Some(id);
-            return;
+        match TerminalSession::spawn_ssh(&server, TerminalSize::normalized(30, 110), ctx) {
+            Ok(session) => {
+                let window_id = self.next_terminal_id;
+                self.next_terminal_id += 1;
+                self.terminals.push(TerminalWindow::new(window_id, session));
+                self.status = format!("Открыт встроенный терминал: {}.", server.name);
+            }
+            Err(error) => self.error_banner = Some(error),
         }
-
-        self.launch_session(&server);
     }
 
     fn launch_session(&mut self, server: &Server) {
@@ -199,6 +270,90 @@ impl ManagerApp {
             }
             Err(error) => self.error_banner = Some(error),
         }
+    }
+
+    /// Открывает окно файлов на сервере (с подтверждением для Prod).
+    pub(crate) fn open_files(&mut self, ctx: &egui::Context, id: u64) {
+        if self.requires_prod_guard(id) {
+            self.pending_action = Some(PendingAction::Files(id));
+            return;
+        }
+        self.open_files_now(ctx, id);
+    }
+
+    fn open_files_now(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let window_id = self.next_files_id;
+        self.next_files_id += 1;
+        let window = FilesWindow::new(window_id, id, server.name);
+        let request = FilesRequest::List {
+            window_id,
+            server_id: id,
+            path: window.path.clone(),
+        };
+        self.files_windows.push(window);
+        self.spawn_files_request(ctx, request);
+    }
+
+    fn spawn_files_request(&mut self, ctx: &egui::Context, request: FilesRequest) {
+        let server_id = match &request {
+            FilesRequest::List { server_id, .. }
+            | FilesRequest::Download { server_id, .. }
+            | FilesRequest::Preview { server_id, .. } => *server_id,
+        };
+        let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let sender = self.files_sender.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let message = match request {
+                FilesRequest::List {
+                    window_id, path, ..
+                } => FilesMessage::Listed {
+                    window_id,
+                    result: remote_files::list_dir(&server, &path),
+                },
+                FilesRequest::Download {
+                    window_id,
+                    remote_path,
+                    open_after,
+                    ..
+                } => FilesMessage::Downloaded {
+                    window_id,
+                    remote_path: remote_path.clone(),
+                    result: remote_files::download(&server, &remote_path),
+                    open_after,
+                },
+                FilesRequest::Preview {
+                    window_id,
+                    remote_path,
+                    ..
+                } => FilesMessage::Previewed {
+                    window_id,
+                    name: remote_files::remote_file_name(&remote_path),
+                    result: remote_files::read_text(&server, &remote_path),
+                },
+            };
+            let _ = sender.send(message);
+            ctx.request_repaint();
+        });
     }
 
     /// Копирует готовую SSH-команду в буфер обмена.
@@ -493,7 +648,12 @@ impl ManagerApp {
             }
         }
 
-        if let Some(id) = self.pending_connect {
+        if let Some(action) = self.pending_action {
+            let id = match action {
+                PendingAction::External(id)
+                | PendingAction::Terminal(id)
+                | PendingAction::Files(id) => id,
+            };
             let Some(server) = self
                 .config
                 .servers
@@ -501,7 +661,7 @@ impl ManagerApp {
                 .find(|server| server.id == id)
                 .cloned()
             else {
-                self.pending_connect = None;
+                self.pending_action = None;
                 return;
             };
 
@@ -535,12 +695,84 @@ impl ManagerApp {
             }
             match decision {
                 Some(true) => {
-                    self.pending_connect = None;
-                    self.launch_session(&server);
+                    self.pending_action = None;
+                    match action {
+                        PendingAction::External(id) => self.launch_external_now(id),
+                        PendingAction::Terminal(id) => self.open_terminal_now(ctx, id),
+                        PendingAction::Files(id) => self.open_files_now(ctx, id),
+                    }
                 }
-                Some(false) => self.pending_connect = None,
+                Some(false) => self.pending_action = None,
                 None => {}
             }
+        }
+    }
+
+    /// Рисует открытые окна встроенных терминалов.
+    fn terminal_windows(&mut self, ctx: &egui::Context) {
+        let mut close_index: Option<usize> = None;
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            let mut open = terminal.open;
+            let title = terminal.session.title.clone();
+            egui::Window::new(format!("Терминал — {title}"))
+                .id(egui::Id::unique(("terminal-window", terminal.id)))
+                .open(&mut open)
+                .default_size([860.0, 540.0])
+                .resizable(true)
+                .show(ctx, |ui| terminal.show(ui));
+            terminal.open = open;
+            if !open {
+                close_index = Some(index);
+            }
+        }
+        if let Some(index) = close_index {
+            self.terminals.remove(index);
+        }
+    }
+
+    /// Рисует окна файлов и запускает фоновые операции.
+    fn files_windows_ui(&mut self, ctx: &egui::Context) {
+        let mut close_index: Option<usize> = None;
+        for (index, window) in self.files_windows.iter_mut().enumerate() {
+            let mut open = window.open;
+            let title = format!("Файлы — {}", window.server_name);
+            egui::Window::new(title)
+                .id(egui::Id::unique(("files-window", window.id)))
+                .open(&mut open)
+                .default_size([880.0, 560.0])
+                .resizable(true)
+                .show(ctx, |ui| window.show(ui));
+            window.open = open;
+            if !open {
+                close_index = Some(index);
+            }
+        }
+        if let Some(index) = close_index {
+            self.files_windows.remove(index);
+        }
+
+        let requests: Vec<FilesRequest> = self
+            .files_windows
+            .iter_mut()
+            .filter_map(FilesWindow::take_request)
+            .collect();
+        for request in requests {
+            self.spawn_files_request(ctx, request);
+        }
+    }
+
+    fn apply_files_message(&mut self, message: FilesMessage) {
+        let window_id = match &message {
+            FilesMessage::Listed { window_id, .. }
+            | FilesMessage::Downloaded { window_id, .. }
+            | FilesMessage::Previewed { window_id, .. } => *window_id,
+        };
+        if let Some(window) = self
+            .files_windows
+            .iter_mut()
+            .find(|window| window.id == window_id)
+        {
+            window.apply_message(message);
         }
     }
 }
@@ -554,6 +786,9 @@ impl eframe::App for ManagerApp {
         }
         if updates > 0 {
             self.status = format!("Обновлены результаты проверки: {updates}.");
+        }
+        while let Ok(message) = self.files_receiver.try_recv() {
+            self.apply_files_message(message);
         }
     }
 
@@ -573,6 +808,8 @@ impl eframe::App for ManagerApp {
         });
 
         self.modals(&ctx);
+        self.terminal_windows(&ctx);
+        self.files_windows_ui(&ctx);
     }
 }
 
@@ -603,6 +840,7 @@ mod tests {
 
         fn app(&self, servers: Vec<Server>) -> ManagerApp {
             let (probe_sender, probe_receiver) = mpsc::channel();
+            let (files_sender, files_receiver) = mpsc::channel();
             ManagerApp {
                 config: AppConfig {
                     servers,
@@ -620,7 +858,13 @@ mod tests {
                 probes: HashMap::new(),
                 probe_sender,
                 probe_receiver,
-                pending_connect: None,
+                pending_action: None,
+                terminals: Vec::new(),
+                next_terminal_id: 1,
+                files_windows: Vec::new(),
+                files_sender,
+                files_receiver,
+                next_files_id: 1,
                 snippet_search: String::new(),
                 snippet_editor: None,
                 keygen: None,
@@ -743,8 +987,15 @@ mod tests {
         let data = TempData::new();
         let mut app = data.app(vec![server(1, "prod-web", "10.0.0.1", "Prod")]);
 
-        app.connect(1);
-        assert_eq!(app.pending_connect, Some(1));
+        app.launch_external(1);
+        assert_eq!(app.pending_action, Some(PendingAction::External(1)));
+
+        let ctx = egui::Context::default();
+        app.open_terminal(&ctx, 1);
+        assert_eq!(app.pending_action, Some(PendingAction::Terminal(1)));
+
+        app.open_files(&ctx, 1);
+        assert_eq!(app.pending_action, Some(PendingAction::Files(1)));
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! Общие элементы интерфейса.
 
 pub mod editor;
+pub mod files;
 pub mod import;
 pub mod keygen;
 pub mod servers;
 pub mod snippets;
+pub mod terminal;
 pub mod tunnels;
 
 use eframe::egui;

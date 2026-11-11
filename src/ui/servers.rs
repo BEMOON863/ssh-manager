@@ -9,7 +9,9 @@ use crate::theme;
 use crate::ui::{format_target, group_badge, probe_indicator};
 
 enum RowAction {
-    Connect(u64),
+    Terminal(u64),
+    External(u64),
+    Files(u64),
     Probe(u64),
     Copy(u64),
     Edit(u64),
@@ -174,13 +176,19 @@ impl ManagerApp {
                             if ui.button("Проверить").clicked() {
                                 action = Some(RowAction::Probe(server.id));
                             }
+                            if ui.small_button("Внешний").clicked() {
+                                action = Some(RowAction::External(server.id));
+                            }
+                            if ui.button("Файлы").clicked() {
+                                action = Some(RowAction::Files(server.id));
+                            }
                             let connect = egui::Button::new(
-                                egui::RichText::new("Подключиться")
+                                egui::RichText::new("Терминал")
                                     .color(egui::Color32::from_rgb(6, 20, 12)),
                             )
                             .fill(theme::SUCCESS);
                             if ui.add(connect).clicked() {
-                                action = Some(RowAction::Connect(server.id));
+                                action = Some(RowAction::Terminal(server.id));
                             }
                         });
                     });
@@ -221,7 +229,9 @@ impl ManagerApp {
 
     fn handle_row_action(&mut self, ctx: &egui::Context, action: RowAction) {
         match action {
-            RowAction::Connect(id) => self.connect(id),
+            RowAction::Terminal(id) => self.open_terminal(ctx, id),
+            RowAction::External(id) => self.launch_external(id),
+            RowAction::Files(id) => self.open_files(ctx, id),
             RowAction::Probe(id) => self.probe_one(ctx, id),
             RowAction::Copy(id) => self.copy_command(ctx, id),
             RowAction::Edit(id) => self.open_editor(id),
